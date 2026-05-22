@@ -12,7 +12,7 @@ use tch::{Device, Kind, Tensor};
 
 use crate::index::create::{compress_into_codes, packbits, Metadata};
 use crate::search::load::LoadedIndex;
-use crate::search::tensor::scalar_quantile_kthvalue;
+use crate::search::tensor::{scalar_quantile_kthvalue, scalar_quantile_sort};
 
 /// The default batch size for processing chunks of documents (I/O Buffering).
 const DEFAULT_PROC_CHUNK_SIZE: usize = 25_000;
@@ -34,6 +34,7 @@ pub fn update_index(
     batch_size: i64,
     index: &LoadedIndex,
     update_threshold: bool,
+    deterministic: bool,
 ) -> Result<()> {
     let _grad_guard = tch::no_grad_guard();
     let idx_path_obj = Path::new(idx_path);
@@ -136,7 +137,7 @@ pub fn update_index(
             let split_embs = batch_tensor.split(safe_batch_size, 0);
 
             for micro_batch in split_embs.into_iter() {
-                let codes = compress_into_codes(&micro_batch, &index.codec.centroids);
+                let codes = compress_into_codes(&micro_batch, &index.codec.centroids, deterministic);
 
                 let reconstructed = index.codec.centroids.index_select(0, &codes);
                 let mut res = &micro_batch - &reconstructed;
@@ -278,7 +279,11 @@ pub fn update_index(
     if update_threshold && !all_residual_norms.is_empty() {
         let new_norms = Tensor::cat(&all_residual_norms, 0).to_device(Device::Cpu);
         let new_count = new_norms.size()[0];
-        let new_threshold_tensor = scalar_quantile_kthvalue(&new_norms, 0.75);
+        let new_threshold_tensor = if deterministic {
+            scalar_quantile_sort(&new_norms, 0.75)
+        } else {
+            scalar_quantile_kthvalue(&new_norms, 0.75)
+        };
         let new_threshold_val: f64 = f64::try_from(&new_threshold_tensor).unwrap_or(0.0);
 
         let thresh_fpath = idx_path_obj.join("cluster_threshold.npy");

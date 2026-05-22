@@ -223,6 +223,7 @@ def process_update(
     delete_fn: Callable,
     compute_kmeans_fn: Callable,
     format_embeddings_fn: Callable,
+    deterministic: bool = False,
 ) -> dict[str, Any]:
     """Execute the update logic for FastPlaid.
 
@@ -419,6 +420,7 @@ def process_update(
             embeddings=documents_embeddings,
             batch_size=batch_size,
             update_threshold_centroids=True,
+            deterministic=deterministic,
         )
 
         return partial_reload(
@@ -442,6 +444,7 @@ def process_update(
         embeddings=documents_embeddings,
         batch_size=batch_size,
         update_threshold_centroids=False,
+        deterministic=deterministic,
     )
 
     return partial_reload(

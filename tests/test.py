@@ -1415,3 +1415,42 @@ def test():
 
     index.close()
     shutil.rmtree(index_name, ignore_errors=True)
+
+
+class TestDeterministic:
+    """Verify deterministic mode produces bit-identical results across builds on CUDA.
+
+    CPU is already deterministic; the surfaces this exercises (sort-based
+    argmax/topk/quantile, non-Triton k-means) only differ on CUDA.
+    """
+
+    @pytest.mark.skipif(
+        not torch.cuda.is_available(), reason="deterministic mode targets CUDA paths"
+    )
+    def test_two_builds_same_seed_match(self, tmp_path):
+        rng = torch.Generator().manual_seed(0)
+        docs = [torch.randn(300, 128, generator=rng) for _ in range(100)]
+        queries = torch.randn(10, 30, 128, generator=rng)
+
+        path_a = str(tmp_path / "a")
+        path_b = str(tmp_path / "b")
+        os.makedirs(path_a, exist_ok=True)
+        os.makedirs(path_b, exist_ok=True)
+
+        def build_and_search(path):
+            idx = search.FastPlaid(index=path, device="cuda:0", deterministic=True)
+            idx.create(documents_embeddings=docs, kmeans_niters=4, seed=42)
+            results = idx.search(queries_embeddings=queries, top_k=10)
+            idx.close()
+            return results
+
+        results_a = build_and_search(path_a)
+        results_b = build_and_search(path_b)
+
+        ids_a = [[doc_id for doc_id, _ in q] for q in results_a]
+        ids_b = [[doc_id for doc_id, _ in q] for q in results_b]
+        assert ids_a == ids_b, "deterministic builds returned different doc IDs"
+
+        scores_a = [[s for _, s in q] for q in results_a]
+        scores_b = [[s for _, s in q] for q in results_b]
+        assert scores_a == scores_b, "deterministic builds returned different scores"

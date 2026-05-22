@@ -198,6 +198,7 @@ def search_on_device(
     index_object: Any,
     show_progress: bool,
     subset: list[list[int]] | None = None,
+    deterministic: bool = False,
 ) -> list[list[tuple[int, float]]]:
     """Perform a search on a single specified device using the passed object.
 
@@ -236,6 +237,7 @@ def search_on_device(
         n_full_scores=n_full_scores,
         top_k=top_k,
         n_ivf_probe=n_ivf_probe,
+        deterministic=deterministic,
     )
 
     scores = fast_plaid_rust.pysearch(
@@ -266,6 +268,7 @@ def search_on_device_with_token_scores(
     index_object: Any,
     show_progress: bool,
     subset: list[list[int]] | None = None,
+    deterministic: bool = False,
 ) -> list[list[tuple[int, float, torch.Tensor]]]:
     """Perform a search on a single device, returning token-level similarity matrices.
 
@@ -303,6 +306,7 @@ def search_on_device_with_token_scores(
         n_full_scores=n_full_scores,
         top_k=top_k,
         n_ivf_probe=n_ivf_probe,
+        deterministic=deterministic,
     )
 
     results = fast_plaid_rust.pysearch_with_token_scores(
@@ -333,6 +337,7 @@ class FastPlaid:
         index: str,
         device: str | list[str] | None = None,
         low_memory: bool = True,
+        deterministic: bool = False,
         **kwargs: Any,  # noqa: ARG002
     ) -> None:
         """Initialize the FastPlaid instance.
@@ -345,10 +350,33 @@ class FastPlaid:
             The device(s) to use for index operations (e.g., 'cuda:0', 'cpu').
         low_memory:
             Whether to use low memory mode when loading the index.
+        deterministic:
+            If True, route index creation and search through deterministic
+            CUDA paths: sort-based argmax/topk/quantile (CUDA `argmax`/`topk`
+            tie-break by memory order; CUDA `kthvalue` has no deterministic
+            implementation) and the standard K-means kernel (the Triton path
+            uses non-deterministic atomics). Results are bit-identical across
+            runs with the same seed and inputs.
+
+            Cost on CUDA (H200, see docs/benchmark/deterministic_benchmark.py):
+            index creation is ~10-15% slower at modest scale, but the gap
+            grows to +35-70% on workloads where the standard k-means kernel
+            is meaningfully slower than Triton (long documents, 100K+ docs).
+            Search overhead is workload-dependent: ~0-20% slower for small
+            candidate sets, but can actually be *faster* at large scale
+            (250K+ docs) where sort and topk perform comparably and the
+            sort path benefits from regular memory traffic.
+
+            CPU output is already deterministic, so the flag changes nothing
+            observable on CPU — but it still routes through the slower
+            sort-based ops there, so leave it off on CPU unless you have a
+            reason.
         kwargs:
             Additional keyword arguments.
 
         """
+        self.deterministic = deterministic
+
         if device is not None and isinstance(device, str):
             self.devices = [device]
         elif isinstance(device, list):
@@ -594,6 +622,10 @@ class FastPlaid:
             # Use the first device for creation logic
             primary_device = self.devices[0]
 
+            # Force the standard CUDA K-means path when deterministic is requested:
+            # the Triton kernel uses non-deterministic atomics.
+            effective_use_triton = False if self.deterministic else use_triton_kmeans
+
             centroids = compute_kmeans(
                 documents_embeddings=documents_embeddings,
                 dim=dim,
@@ -602,7 +634,7 @@ class FastPlaid:
                 max_points_per_centroid=max_points_per_centroid,
                 n_samples_kmeans=n_samples_kmeans,
                 seed=seed,
-                use_triton_kmeans=use_triton_kmeans,
+                use_triton_kmeans=effective_use_triton,
             )
 
             fast_plaid_rust.create(
@@ -616,6 +648,7 @@ class FastPlaid:
                 batch_size=batch_size,
                 seed=seed,
                 compress_only=compress_only,
+                deterministic=self.deterministic,
             )
 
             # Explicit cleanup of create objects
@@ -701,11 +734,12 @@ class FastPlaid:
                 seed=seed,
                 start_from_scratch=start_from_scratch,
                 buffer_size=buffer_size,
-                use_triton_kmeans=use_triton_kmeans,
+                use_triton_kmeans=False if self.deterministic else use_triton_kmeans,
                 create_fn=self.create,
                 delete_fn=self.delete,
                 compute_kmeans_fn=compute_kmeans,
                 format_embeddings_fn=self._format_embeddings,
+                deterministic=self.deterministic,
             )
 
             # Atomic swap of indices dictionary
@@ -810,6 +844,7 @@ class FastPlaid:
         n_ivf_probe: int,
         show_progress: bool,
         n_processes: int | None = None,
+        deterministic: bool = False,
     ) -> list:
         """Dispatch search across devices, including joblib CPU parallelism.
 
@@ -875,6 +910,7 @@ class FastPlaid:
                     index_object=search_indices["cpu"],
                     show_progress=(show_progress and i == 0),
                     subset=sub_chunk,
+                    deterministic=deterministic,
                 )
                 for i, (chunk, sub_chunk) in enumerate(zip(query_chunks, subset_chunks))
             )
@@ -891,6 +927,7 @@ class FastPlaid:
                 index_object=search_indices[self.devices[0]],
                 show_progress=show_progress,
                 subset=subset,
+                deterministic=deterministic,
             )
 
         # Multi-GPU split
@@ -921,6 +958,7 @@ class FastPlaid:
                         index_object=search_indices[device],
                         show_progress=show_progress and (i == 0),
                         subset=subset_chunks_gpu[i],
+                        deterministic=deterministic,
                     )
                 )
 
@@ -983,6 +1021,7 @@ class FastPlaid:
             n_ivf_probe=n_ivf_probe,
             show_progress=show_progress,
             n_processes=n_processes,
+            deterministic=self.deterministic,
         )
 
     @torch.inference_mode()
@@ -1043,6 +1082,7 @@ class FastPlaid:
             n_ivf_probe=n_ivf_probe,
             show_progress=show_progress,
             n_processes=n_processes,
+            deterministic=self.deterministic,
         )
 
     @torch.inference_mode()

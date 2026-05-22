@@ -15,7 +15,7 @@ use std::io::{BufReader, BufWriter, Write};
 use std::path::Path;
 use tch::{Device, Kind, Tensor};
 
-use crate::search::tensor::scalar_quantile_kthvalue;
+use crate::search::tensor::{scalar_quantile_kthvalue, scalar_quantile_sort, stable_argmax};
 use crate::utils::residual_codec::ResidualCodec;
 
 /// Holds metadata for a chunk of the index, including the number of
@@ -145,7 +145,7 @@ pub fn optimize_ivf(
 /// # Returns
 ///
 /// `codes` - Shape `[N]`, indices of the nearest centroid for each embedding.
-pub fn compress_into_codes(embeddings: &Tensor, centroids: &Tensor) -> Tensor {
+pub fn compress_into_codes(embeddings: &Tensor, centroids: &Tensor, deterministic: bool) -> Tensor {
     let num_docs = embeddings.size()[0];
     let mut codes_list = Vec::new();
 
@@ -159,8 +159,12 @@ pub fn compress_into_codes(embeddings: &Tensor, centroids: &Tensor) -> Tensor {
         // Operation: [Batch, D] @ [D, K] -> [Batch, K] (Row-Major results)
         let scores = chunk.matmul(&centroids_t);
 
-        // argmax(dim=1) scans contiguous memory (fastest possible path)
-        let chunk_codes = scores.argmax(1, false);
+        let chunk_codes = if deterministic {
+            // Avoid CUDA-nondeterministic tie-breaking in argmax.
+            stable_argmax(&scores, 1, false)
+        } else {
+            scores.argmax(1, false)
+        };
 
         codes_list.push(chunk_codes);
 
@@ -213,6 +217,7 @@ pub fn create_index(
     batch_size: i64,
     seed: Option<u64>,
     compress_only: bool,
+    deterministic: bool,
 ) -> Result<()> {
     let n_docs = documents_embeddings.len();
     let n_chunks = (n_docs as f64 / (batch_size as f64).min(1.0 + n_docs as f64)).ceil() as usize;
@@ -314,7 +319,7 @@ pub fn create_index(
         device,
     )?;
 
-    let heldout_codes = compress_into_codes(&heldout_samples, &initial_codec.centroids);
+    let heldout_codes = compress_into_codes(&heldout_samples, &initial_codec.centroids, deterministic);
 
     let mut reconstructed_embeddings_vec = Vec::new();
     for code_batch_indexes in heldout_codes.split(batch_size, 0) {
@@ -331,7 +336,8 @@ pub fn create_index(
 
     // Compute cluster threshold from residual distances
     let heldout_distances = heldout_res_raw.norm_scalaropt_dim(2, &[1], false);
-    let inferred_threshold = scalar_quantile_kthvalue(&heldout_distances, 0.75);
+    let quantile_fn = if deterministic { scalar_quantile_sort } else { scalar_quantile_kthvalue };
+    let inferred_threshold = quantile_fn(&heldout_distances, 0.75);
 
     let thresh_fpath = Path::new(index_path).join("cluster_threshold.npy");
     inferred_threshold
@@ -352,14 +358,14 @@ pub fn create_index(
     let mut cutoff_vals: Vec<Tensor> = Vec::new();
     for i in 1..n_options as i64 {
         let q = i as f64 / n_options as f64;
-        cutoff_vals.push(scalar_quantile_kthvalue(&heldout_flat, q));
+        cutoff_vals.push(quantile_fn(&heldout_flat, q));
     }
     let bucket_cutoffs = Tensor::cat(&cutoff_vals, 0);
 
     let mut weight_vals: Vec<Tensor> = Vec::new();
     for i in 0..n_options as i64 {
         let q = (i as f64 + 0.5) / n_options as f64;
-        weight_vals.push(scalar_quantile_kthvalue(&heldout_flat, q));
+        weight_vals.push(quantile_fn(&heldout_flat, q));
     }
     let bucket_weights = Tensor::cat(&weight_vals, 0);
 
@@ -402,7 +408,7 @@ pub fn create_index(
     bar.set_message("Creating index...");
 
     let process_batch = |batch_tensor: Tensor| -> Result<(Tensor, Tensor)> {
-        let codes = compress_into_codes(&batch_tensor, &final_codec.centroids);
+        let codes = compress_into_codes(&batch_tensor, &final_codec.centroids, deterministic);
 
         let mut rec_list = Vec::new();
         for sub_code in codes.split(batch_size, 0) {

@@ -129,6 +129,7 @@ fn initialize_torch(_py: Python<'_>, torch_path: String) -> PyResult<()> {
 /// Raises:
 ///     RuntimeError: If index creation fails or `libtorch` fails to load.
 #[pyfunction]
+#[pyo3(signature = (index, torch_path, device, embedding_dim, nbits, embeddings, centroids, batch_size, seed, compress_only, deterministic=false))]
 fn create(
     _py: Python<'_>,
     index: String,
@@ -141,6 +142,7 @@ fn create(
     batch_size: i64,
     seed: Option<u64>,
     compress_only: bool,
+    deterministic: bool,
 ) -> PyResult<()> {
     call_torch(torch_path)
         .map_err(|e| PyRuntimeError::new_err(format!("Failed to load Torch library: {}", e)))?;
@@ -158,6 +160,7 @@ fn create(
         batch_size,
         seed,
         compress_only,
+        deterministic,
     )
     .map_err(|e| PyRuntimeError::new_err(format!("Failed to create index: {}", e)));
 
@@ -299,6 +302,7 @@ fn pysearch_with_token_scores(
 /// Raises:
 ///     RuntimeError: If updating the index fails or `libtorch` fails to load.
 #[pyfunction]
+#[pyo3(signature = (index_path, index, torch_path, device, embeddings, batch_size, update_threshold_centroids=None, deterministic=false))]
 fn update(
     _py: Python<'_>,
     index_path: String,
@@ -308,6 +312,7 @@ fn update(
     embeddings: Vec<PyTensor>,
     batch_size: i64,
     update_threshold_centroids: Option<bool>,
+    deterministic: bool,
 ) -> PyResult<()> {
     call_torch(torch_path)
         .map_err(|e| PyRuntimeError::new_err(format!("Failed to load Torch library: {}", e)))?;
@@ -321,6 +326,7 @@ fn update(
         batch_size,
         &index.inner,
         update_threshold_centroids.unwrap_or(false),
+        deterministic,
     )
     .map_err(|e| PyRuntimeError::new_err(format!("Failed to update index: {}", e)))?;
 

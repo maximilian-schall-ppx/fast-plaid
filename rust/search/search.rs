@@ -8,7 +8,7 @@ use pyo3_tch::PyTensor;
 
 use crate::search::load::LoadedIndex;
 use crate::search::padding::direct_pad_sequences;
-use crate::search::tensor::StridedTensor;
+use crate::search::tensor::{stable_argmax, stable_topk, StridedTensor};
 use crate::utils::residual_codec::ResidualCodec;
 
 /// Decompresses residual vectors from a packed, quantized format.
@@ -183,18 +183,29 @@ pub struct SearchParameters {
     /// Number of IVF cells to probe during the initial search.
     #[pyo3(get, set)]
     pub n_ivf_probe: usize,
+    /// If true, use deterministic-on-CUDA implementations of argmax/topk.
+    #[pyo3(get, set)]
+    pub deterministic: bool,
 }
 
 #[pymethods]
 impl SearchParameters {
     /// Creates a new `SearchParameters` instance from Python.
     #[new]
-    fn new(batch_size: usize, n_full_scores: usize, top_k: usize, n_ivf_probe: usize) -> Self {
+    #[pyo3(signature = (batch_size, n_full_scores, top_k, n_ivf_probe, deterministic=false))]
+    fn new(
+        batch_size: usize,
+        n_full_scores: usize,
+        top_k: usize,
+        n_ivf_probe: usize,
+        deterministic: bool,
+    ) -> Self {
         Self {
             batch_size,
             n_full_scores,
             top_k,
             n_ivf_probe,
+            deterministic,
         }
     }
 }
@@ -264,6 +275,7 @@ pub fn search_many(
             device,
             subset_tensor.as_ref(),
             false,
+            params.deterministic,
         )
         .unwrap_or_default();
 
@@ -338,6 +350,7 @@ pub fn search_many_with_token_scores(
             device,
             subset_tensor.as_ref(),
             true,
+            params.deterministic,
         )
         .unwrap_or_default();
 
@@ -483,6 +496,7 @@ pub fn search(
     device: Device,
     subset: Option<&Tensor>,
     return_token_scores: bool,
+    deterministic: bool,
 ) -> anyhow::Result<(Vec<i64>, Vec<f32>, Option<Vec<Tensor>>)> {
     let (passage_ids, scores, token_matrices) = tch::no_grad(|| {
         let query_embeddings_unsqueezed = query_embeddings.unsqueeze(0);
@@ -507,7 +521,13 @@ pub fn search(
                 let actual_k = n_ivf_probe.min(available_centroids);
 
                 let top_indices_local = if actual_k == 1 {
-                    subset_scores.argmax(0, true)
+                    if deterministic {
+                        stable_argmax(&subset_scores, 0, true)
+                    } else {
+                        subset_scores.argmax(0, true)
+                    }
+                } else if deterministic {
+                    stable_topk(&subset_scores, actual_k, 0).1
                 } else {
                     subset_scores.topk(actual_k, 0, true, false).1
                 };
@@ -518,7 +538,15 @@ pub fn search(
         } else {
             // Standard path
             let selected_ivf_cells_indices = if n_ivf_probe == 1 {
-                query_centroid_scores.argmax(0, true).permute(&[1, 0])
+                if deterministic {
+                    stable_argmax(&query_centroid_scores, 0, true).permute(&[1, 0])
+                } else {
+                    query_centroid_scores.argmax(0, true).permute(&[1, 0])
+                }
+            } else if deterministic {
+                stable_topk(&query_centroid_scores, n_ivf_probe, 0)
+                    .1
+                    .permute(&[1, 0])
             } else {
                 query_centroid_scores
                     .topk(n_ivf_probe, 0, true, false)
@@ -603,8 +631,11 @@ pub fn search(
 
         // Prune candidates for re-ranking
         if n_docs_for_full_score < approx_scores.size()[0] && approx_scores.numel() > 0 {
-            let (top_scores, top_indices) =
-                approx_scores.topk(n_docs_for_full_score, 0, true, true);
+            let (top_scores, top_indices) = if deterministic {
+                stable_topk(&approx_scores, n_docs_for_full_score, 0)
+            } else {
+                approx_scores.topk(n_docs_for_full_score, 0, true, true)
+            };
 
             passage_ids_to_rerank = passage_ids_to_rerank.index_select(0, &top_indices);
             approx_scores = top_scores;
@@ -613,8 +644,11 @@ pub fn search(
         // Further reduce candidates for decompression
         let n_passage_ids_for_decompression = (n_docs_for_full_score / 4).max(1);
         if n_passage_ids_for_decompression < approx_scores.size()[0] && approx_scores.numel() > 0 {
-            let (_, top_indices) =
-                approx_scores.topk(n_passage_ids_for_decompression, 0, true, true);
+            let (_, top_indices) = if deterministic {
+                stable_topk(&approx_scores, n_passage_ids_for_decompression, 0)
+            } else {
+                approx_scores.topk(n_passage_ids_for_decompression, 0, true, true)
+            };
             passage_ids_to_rerank = passage_ids_to_rerank.index_select(0, &top_indices);
         }
 

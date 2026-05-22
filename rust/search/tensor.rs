@@ -1,6 +1,30 @@
 use std::collections::HashMap;
 use tch::{Device, Kind, Tensor};
 
+/// Deterministic argmax via sort: returns the index of the largest element along `dim`.
+/// On CUDA, `argmax` breaks ties by memory access order (non-deterministic across runs).
+/// `sort(descending=true)` is deterministic on CUDA, and selecting the first index gives
+/// a stable argmax.
+pub fn stable_argmax(tensor: &Tensor, dim: i64, keepdim: bool) -> Tensor {
+    let (_, sorted_indices) = tensor.sort(dim, true);
+    let argmax = sorted_indices.select(dim, 0);
+    if keepdim {
+        argmax.unsqueeze(dim)
+    } else {
+        argmax
+    }
+}
+
+/// Deterministic top-k via sort. Returns (values, indices), both shape [k] along `dim`.
+/// `topk` on CUDA can break ties non-deterministically; `sort` does not.
+pub fn stable_topk(tensor: &Tensor, k: i64, dim: i64) -> (Tensor, Tensor) {
+    let (sorted_values, sorted_indices) = tensor.sort(dim, true);
+    (
+        sorted_values.narrow(dim, 0, k),
+        sorted_indices.narrow(dim, 0, k),
+    )
+}
+
 /// Computes a single quantile for a 1D tensor using `kthvalue`.
 ///
 /// This function calculates the value below which a given percentage of data falls.
@@ -28,6 +52,30 @@ pub fn scalar_quantile_kthvalue(tensor: &Tensor, q: f64) -> Tensor {
 
     let (lower_val, _) = tensor.kthvalue(lower_idx + 1, 0, true);
     let (upper_val, _) = tensor.kthvalue(upper_idx + 1, 0, true);
+
+    let weight = idx_float - lower_idx as f64;
+    lower_val.lerp(&upper_val, weight)
+}
+
+/// Deterministic-on-CUDA variant of `scalar_quantile_kthvalue` that uses `sort`
+/// instead of `kthvalue` (which has no deterministic CUDA implementation).
+/// Slightly more expensive (full sort vs partial selection) but only called
+/// during index creation, so the cost is amortized.
+pub fn scalar_quantile_sort(tensor: &Tensor, q: f64) -> Tensor {
+    let n = tensor.size()[0];
+
+    let idx_float = q * (n - 1) as f64;
+    let lower_idx = idx_float.floor() as i64;
+    let upper_idx = idx_float.ceil() as i64;
+
+    let (sorted, _) = tensor.sort(0, false);
+
+    if lower_idx == upper_idx {
+        return sorted.get(lower_idx).unsqueeze(0);
+    }
+
+    let lower_val = sorted.get(lower_idx).unsqueeze(0);
+    let upper_val = sorted.get(upper_idx).unsqueeze(0);
 
     let weight = idx_float - lower_idx as f64;
     lower_val.lerp(&upper_val, weight)
@@ -149,9 +197,16 @@ pub struct StridedTensor {
 impl StridedTensor {
     /// Computes optimal strides based on the distribution of element lengths.
     ///
-    /// Strides are determined by sampling quantiles, ensuring that common sequence
-    /// lengths are well-represented. The maximum element length is always included.
-    fn compute_strides(lengths: &Tensor, max_len: i64, device: Device) -> Vec<i64> {
+    /// Strides are determined by quantiles of the length distribution, ensuring
+    /// that common sequence lengths are well-represented. The maximum element
+    /// length is always included.
+    ///
+    /// This is deterministic on all devices: the previous implementation used
+    /// an unseeded `randint` subsample plus `kthvalue` (non-deterministic on
+    /// CUDA). We now sort the full length tensor once and index at the
+    /// quantile positions — sort is deterministic on CUDA, and a 1D int sort
+    /// at index-load time is negligible relative to the rest of load.
+    fn compute_strides(lengths: &Tensor, max_len: i64) -> Vec<i64> {
         if lengths.numel() == 0 {
             return if max_len > 0 {
                 vec![max_len]
@@ -160,21 +215,16 @@ impl StridedTensor {
             };
         }
 
-        let sampled_lengths = if lengths.size()[0] >= 5000 {
-            let indices = Tensor::randint(lengths.size()[0], &[2000], (Kind::Int64, device));
-            lengths.index_select(0, &indices)
-        } else {
-            lengths.shallow_clone()
-        }
-        .to_kind(Kind::Float);
+        let n = lengths.size()[0];
+        let (sorted, _) = lengths.to_kind(Kind::Int64).sort(0, false);
 
         let target_quantiles = [0.5, 0.75, 0.9, 0.95];
 
         let mut strides: Vec<i64> = target_quantiles
             .iter()
             .map(|&q| {
-                let val_tensor = scalar_quantile_kthvalue(&sampled_lengths, q);
-                val_tensor.int64_value(&[])
+                let idx = (q * (n - 1) as f64).round() as i64;
+                sorted.get(idx).int64_value(&[])
             })
             .filter(|&s| s > 0)
             .collect();
@@ -216,7 +266,7 @@ impl StridedTensor {
             0
         };
 
-        let precomputed_strides = Self::compute_strides(&element_lengths, max_element_len, device);
+        let precomputed_strides = Self::compute_strides(&element_lengths, max_element_len);
 
         let cumulative_lengths = {
             let zero_start = Tensor::zeros(&[1], (Kind::Int64, device));
